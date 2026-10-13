@@ -1,0 +1,51 @@
+name: publish
+
+# Upvera günlük kökü (Değer Ağı Y3 · CC-D5): her gece okuma kapısından yeni günleri çeker, doğrular (tools/days.mjs), dosyaya yazar,
+# OpenTimestamps ile Bitcoin'e zaman damgası alır (ücretsiz, herkese açık takvim sunucuları), bekleyen damgaları yükseltir ve işler.
+# Gizli anahtar yok: UPVERA_API + UPVERA_ANON_KEY depo DEĞİŞKENİdir (anon anahtar zaten herkese açık).
+# Upvera veritabanı bu dosyaları kendisi geri okur ve kayıtla bayt bayt karşılaştırır (gözcü BLK-P) — yayın tek yönlü güven değildir.
+# Eylemler commit SHA'sıyla sabit (etiket sonradan başka koda taşınamaz); `main` dal korumalı (README §Dal koruması) — geçmiş yeniden yazılamaz.
+
+on:
+  schedule:
+    - cron: '37 2 * * *'   # 02:37 UTC — gün 00:00'da kapanır, dış kütük onayı dakikalar içinde
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      UPVERA_API: ${{ vars.UPVERA_API }}
+      UPVERA_ANON_KEY: ${{ vars.UPVERA_ANON_KEY }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7.0.1 — SHA ile sabit (D2: etiket taşınamaz)
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1   # v7.1.0
+        with:
+          node-version: 24
+      - name: Günleri çek ve doğrula
+        run: node tools/days.mjs fetch && node tools/days.mjs verify
+      - name: Zaman damgası (OpenTimestamps)
+        run: |
+          # istemci + bütün bağımlılıkları PyPI dosya özetleriyle sabit (tools/requirements.txt); ayrı sanal ortam, sistem Python'una dokunmaz
+          python3 -m venv "$RUNNER_TEMP/ots"
+          "$RUNNER_TEMP/ots/bin/pip" install --quiet --require-hashes --no-deps -r tools/requirements.txt
+          OTS="$RUNNER_TEMP/ots/bin/ots"
+          if [ ! -d days ]; then echo 'henüz gün yok — damga atlandı'; exit 0; fi
+          git ls-files --others --exclude-standard 'days/*.json' 'days/**/*.json' | while read -r f; do "$OTS" stamp "$f"; done
+          find days -name '*.ots' | while read -r f; do "$OTS" upgrade "$f" || true; done   # Bitcoin onayı ~birkaç saat: bekleyen sonraki gece
+          find days -name '*.bak' -delete
+      - name: İşle
+        run: |
+          git config user.name 'upvera-roots[bot]'
+          git config user.email 'roots@upvera.co'
+          if [ -e genesis.json ]; then git add genesis.json; fi   # yayın başlamadan (okuma kapısı 'off') ikisi de yoktur
+          if [ -d days ]; then git add days; fi
+          if ! git diff --cached --quiet; then git commit -m "günlük kök: $(date -u +%F)" && git push; else echo 'yeni gün yok'; fi
